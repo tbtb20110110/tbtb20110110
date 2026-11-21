@@ -4,25 +4,192 @@ name: Build Clash Boot Helper
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2.1'
+
+      - name: Create Android project
+        run: |
+          mkdir -p app/src/main/java/tw/haier/clashboot
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'ClashBootHelper'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'tw.haier.clashboot'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'tw.haier.clashboot'
+                  minSdk 23
+                  targetSdk 28
+                  versionCode 1
+                  versionName '1.0'
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <application android:label="Clash开机助手" android:allowBackup="false">
+                  <receiver android:name=".BootReceiver" android:enabled="true" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                      </intent-filter>
+                  </receiver>
+                  <service android:name=".BootService" android:exported="false"/>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/tw/haier/clashboot/BootReceiver.java <<'EOF'
+          package tw.haier.clashboot;
+          import android.content.*;
+          import android.os.Build;
+          public class BootReceiver extends BroadcastReceiver {
+              @Override public void onReceive(Context c, Intent i) {
+                  if (Intent.ACTION_BOOT_COMPLETED.equals(i.getAction())) {
+                      Intent s = new Intent(c, BootService.class);
+                      if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(s);
+                      else c.startService(s);
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/tw/haier/clashboot/BootService.java <<'EOF'
+          package tw.haier.clashboot;
+          import android.app.*;
+          import android.content.*;
+          import android.os.*;
+          import java.io.*;
+          public class BootService extends Service {
+              static final String LOG="/data/local/tmp/clash-boot-helper.log";
+              @Override public void onCreate() {
+                  super.onCreate();
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel ch=new NotificationChannel("boot","Clash助手",NotificationManager.IMPORTANCE_LOW);
+                      ((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(ch);
+                  }
+                  Notification.Builder b=Build.VERSION.SDK_INT >= 26 ?
+                      new Notification.Builder(this,"boot") : new Notification.Builder(this);
+                  startForeground(1,b.setContentTitle("Clash开机助手")
+                      .setContentText("正在连接本机ADB").setSmallIcon(android.R.drawable.stat_notify_sync).build());
+              }
+              @Override public int onStartCommand(Intent i,int f,int id) {
+                  new Thread(() -> {
+                      try {
+                          Thread.sleep(30000);
+                          String cmd =
+                              "echo 'boot helper running' >> "+LOG+"; " +
+                              "if [ ! -f /data/local/tmp/clash-watch.sh ]; then " +
+                              "echo 'ERROR watcher script missing' >> "+LOG+"; " +
+                              "else " +
+                              "am start -a com.github.metacubex.clash.meta.action.START_CLASH " +
+                              "-p com.github.metacubex.clash.meta >> "+LOG+" 2>&1; " +
+                              "sleep 5; " +
+                              "/vendor/xbin/busybox nohup /vendor/xbin/busybox setsid " +
+                              "/system/bin/sh /data/local/tmp/clash-watch.sh " +
+                              "</dev/null >> /data/local/tmp/clash-watch.out 2>&1 & " +
+                              "echo 'Watcher launch requested' >> "+LOG+"; fi";
+                          String result=AdbShell.exec(cmd);
+                          log("ADB shell returned: "+result);
+                      } catch(Throwable e) { log("ERROR: "+e.toString()); }
+                      stopForeground(true);
+                      stopSelf();
+                  }).start();
+                  return START_NOT_STICKY;
+              }
+              void log(String s) {
+                  try(FileOutputStream f=new FileOutputStream(LOG,true)) {
+                      f.write((s+"\n").getBytes("UTF-8"));
+                  } catch(Exception ignored) {}
+              }
+              @Override public IBinder onBind(Intent i) { return null; }
+          }
+          EOF
+
+          cat > app/src/main/java/tw/haier/clashboot/AdbShell.java <<'EOF'
+          package tw.haier.clashboot;
+          import java.io.*;
+          import java.net.*;
+          import java.nio.charset.StandardCharsets;
+          final class AdbShell {
+              static void le(DataOutputStream o,int v)throws IOException {
+                  o.write(v); o.write(v>>>8); o.write(v>>>16); o.write(v>>>24);
+              }
+              static int le(DataInputStream i)throws IOException {
+                  return i.readUnsignedByte() | i.readUnsignedByte()<<8 |
+                         i.readUnsignedByte()<<16 | i.readUnsignedByte()<<24;
+              }
+              static int code(String s) {
+                  return s.charAt(0)|s.charAt(1)<<8|s.charAt(2)<<16|s.charAt(3)<<24;
+              }
+              static void packet(DataOutputStream o,String s,int a,int b,byte[] d)throws IOException {
+                  int c=code(s), n=d==null?0:d.length, sum=0;
+                  if(d!=null) for(byte x:d) sum+=x&255;
+                  le(o,c); le(o,a); le(o,b); le(o,n); le(o,sum); le(o,~c);
+                  if(n>0)o.write(d); o.flush();
+              }
+              static String exec(String cmd)throws Exception {
+                  try(Socket s=new Socket()) {
+                      s.connect(new InetSocketAddress("127.0.0.1",5555),5000);
+                      s.setSoTimeout(15000);
+                      DataInputStream in=new DataInputStream(new BufferedInputStream(s.getInputStream()));
+                      DataOutputStream out=new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
+                      packet(out,"CNXN",0x01000001,4096,
+                          "host::features=shell_v2,cmd\n".getBytes(StandardCharsets.UTF_8));
+                      int c=le(in), a=le(in), b=le(in), n=le(in), sum=le(in), magic=le(in);
+                      if(magic!=~c || c!=code("CNXN")) throw new IOException("ADB handshake failed");
+                      byte[] banner=new byte[n]; in.readFully(banner);
+                      packet(out,"OPEN",1,0,("shell:"+cmd+"\0").getBytes(StandardCharsets.UTF_8));
+                      StringBuilder result=new StringBuilder();
+                      while(true) {
+                          c=le(in); a=le(in); b=le(in); n=le(in); sum=le(in); magic=le(in);
+                          if(magic!=~c || n<0 || n>1048576) throw new IOException("Bad ADB packet");
+                          byte[] data=new byte[n]; in.readFully(data);
+                          if(c==code("OKAY")) continue;
+                          if(c==code("WRTE")) {
+                              result.append(new String(data,StandardCharsets.UTF_8));
+                              packet(out,"OKAY",1,a,null);
+                          } else if(c==code("CLSE")) {
+                              packet(out,"CLSE",1,a,null); break;
+                          } else if(c==code("FAIL")) {
+                              throw new IOException(new String(data,StandardCharsets.UTF_8));
+                          } else throw new IOException("Unexpected ADB packet");
+                      }
+                      return result.toString();
+                  }
+              }
+          }
+          EOF
 
       - name: Build APK
         run: gradle assembleDebug
